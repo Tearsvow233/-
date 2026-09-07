@@ -22,6 +22,7 @@ import json
 import time
 import shutil
 import action_scheduler
+from agent_link import AgentLink  # T9 外部 Agent 事件总线（纯逻辑，无 Qt 依赖）
 import random
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -284,6 +285,17 @@ DEFAULT_SETTINGS = {
     # ---- 每日英语单词推送（本地词库，每天一次）----
     "word_enabled": True,   # 开关（灵宠中心可关）
     "word_count": 10,       # 每天推送词量（5~20，默认 10）
+    # ---- Agent Link 事件总线（T9：让外部 Agent 驱动宠物动作）----
+    "agent_link_enabled": False,   # 默认关；开了会在 <config_dir>/agent-events 监听 .jsonl
+    "agent_link_poll_ms": 500,     # 轮询间隔 ms（500ms 足够灵敏，几乎无磁盘负担）
+    "agent_link_stale_sec": 60,    # 某 agent 多久没新事件 → 回退 idle
+    # 6 态 → 动作 的映射（v1 写死在 settings 不做 UI；想改直接改 settings.json）
+    "agent_link_to_action": {
+        "thinking":  "spin",
+        "working":   "pace",
+        "attention": "recoil",
+        "error":     "spin",
+    },
 }
 
 def _primary_screen():
@@ -1042,6 +1054,9 @@ class TestButton(QWidget):
 
 # ---------- 主窗口：小江本体 ----------
 class PetWindow(QLabel):
+    # T9：AgentLink 在 daemon 线程触发，emit() 跨线程安全；slot 在主线程跑
+    agent_state = Signal(str, dict)  # (state, {agent: (state, ts)})
+
     def __init__(self, settings):
         super().__init__()
         self.settings = settings
@@ -1568,6 +1583,34 @@ class PetWindow(QLabel):
         return random.choices(texts, weights=ws, k=1)[0].format(name=self.name())
 
     # ---------- 新动作播放器 ----------
+    # ---------- T9：Agent Link 状态切换 ----------
+    def on_agent_state(self, state, agents):
+        """AgentLink 信号槽：把外部 Agent 聚合态映射到动作。
+        跑在主线程（Qt signal-slot 跨线程自动派发）。
+        idle / sleeping 不动 —— 留给现有调度器 / 入睡状态机。
+        """
+        if state in ("idle", "sleeping"):
+            return
+        mapping = self.settings.get("agent_link_to_action") or {}
+        action = mapping.get(state)
+        if not action:
+            return
+        if action not in self.action_frames:
+            log(f"[agent_link] 映射动作 {action} 不可用（无帧或未加载）")
+            return
+        # 不打断用户主动操作（drag / 拖拽中 / 反应链）
+        if self.state in ("drag", "react"):
+            return
+        log(f"[agent_link] {state} → 动作 {action}")
+        self.play_action(action)
+        if state == "error" and agents:
+            who = "、".join(agents.keys())[:30] or "外部 agent"
+            try:
+                self.bubble.say(f"{who} 好像遇到问题了…",
+                                (self.x(), self.y(), self.width()), ms=3000)
+            except Exception as e:
+                log(f"[agent_link] 气泡失败：{e}")
+
     def play_action(self, name):
         """播放一个动作序列；可被拖拽/点击/切模式打断"""
         frames = self.action_frames.get(name)
@@ -2655,6 +2698,7 @@ def main():
         settings["ai_persona"] = build_persona(
             settings.get("personality", "粘人"), settings.get("pet_name", "小江"))
     pet = PetWindow(settings)
+    pet.agent_state.connect(pet.on_agent_state)  # T9：信号-槽
     pet.show()
 
     tray = make_tray(pet)  # 必须保持引用，否则托盘被回收
