@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- 构建/分发产物 ---
+build/
+dist/
+snapshots/
+output/
+
+# --- 运行时生成 ---
+cache/
+logs/
+probe.txt
+
+# --- 项目本地数据 ---
+.workbuddy/
+settings.json
+tools/qa_settings_backup.json
+
+# --- 大体积备份与预览素材（不入库） ---
+assets/sprites_512_backup_*/
+assets/_preview/
+assets/_preview2/
+
+# --- 演示视频 ---
+*.mp4
+
+# --- IDE ---
+.idea/
+.vscode/
+.probe/
+.git-rewrite/

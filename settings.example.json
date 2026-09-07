@@ -1,0 +1,46 @@
+{
+  "pet_name": "小江",
+  "height": 100,
+  "mode": "normal",
+  "auto_walk": true,
+  "reminders": [
+    {
+      "name": "下课",
+      "mode": "interval",
+      "interval_min": 45,
+      "once": true,
+      "enabled": true
+    },
+    {
+      "name": "喝水",
+      "mode": "interval",
+      "interval_min": 40,
+      "once": false,
+      "enabled": true
+    },
+    {
+      "name": "起来活动一下",
+      "mode": "interval",
+      "interval_min": 30,
+      "once": false,
+      "enabled": true
+    }
+  ],
+  "pos_x": 1528,
+  "pos_y": 608,
+  "personality": "粘人",
+  "sleep_after_min": 5,
+  "action_min_sec": 10,
+  "action_max_sec": 30,
+  "walk_min_sec": 12,
+  "walk_max_sec": 30,
+  "chat_min_sec": 40,
+  "chat_max_sec": 90,
+  "blink_min_sec": 3,
+  "blink_max_sec": 7,
+  "ai_enabled": true,
+  "ai_api_key": "待填",
+  "ai_base_url": "https://open.bigmodel.cn/api/paas/v4",
+  "ai_model": "glm-4-flash-250414",
+  "ai_persona": "你是一只叫小江的布偶猫桌面宠物，可爱、有点傲娇、爱撒娇。用中文简短回复，不超过30字，可以带点语气词。"
+}

@@ -1,0 +1,333 @@
+# -*- coding: utf-8 -*-
+"""每日英语单词推送 —— 词库加载 / 选词 / 进度 / 词卡弹窗（独立模块）。
+
+与 main.py 的边界：
+- 本模块只依赖 PySide6 与标准库，不含宠物状态机；
+- 词卡窗口（WordCardDialog）供 main.PetWindow 弹给用户，统一走全局 DIALOG_QSS；
+- 选词/进度逻辑是纯函数，可被 tools/test_word_push.py 离屏反复测试。
+
+词库结构（assets/words/cet4_core.json）：
+    [{"word": "...", "phonetic": "/.../", "meaning": "...", "example": "可选"}, ...]
+其中 word/phonetic/meaning 非空为硬性要求，加载时会过滤不合格项。
+"""
+import html
+import json
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QVBoxLayout, QWidget,
+)
+
+# 词库资源路径：开发态在项目目录；打包后被 PyInstaller 放进只读 _MEIPASS。
+_BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+
+def words_data_path():
+    """词库 JSON 的完整路径（打包后需与 BabyCat.spec datas 保持同步）"""
+    return _BASE / "assets" / "words" / "cet4_core.json"
+
+
+# ---------------------------------------------------------------------------
+# 词库加载
+# ---------------------------------------------------------------------------
+def load_words(path=None):
+    """加载并校验词库，返回合格词条列表；文件缺失/损坏返回空列表（调用方兜底）。
+
+    硬性过滤：必须是 dict 且 word/phonetic/meaning 三个字段 strip 后非空；
+    按 word 小写去重（保留先出现者）；example 仅保留非空字符串。
+    """
+    p = Path(path) if path else words_data_path()
+    if not p.exists():
+        return []
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    seen = set()
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        w = str(e.get("word") or "").strip()
+        ph = str(e.get("phonetic") or "").strip()
+        m = str(e.get("meaning") or "").strip()
+        if not (w and ph and m):
+            continue
+        low = w.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        item = {"word": w, "phonetic": ph, "meaning": m}
+        ex = e.get("example")
+        if isinstance(ex, str) and ex.strip():
+            item["example"] = ex.strip()
+        out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 每日选词：date 种子 → 连续 N 词，全表轮转
+# ---------------------------------------------------------------------------
+_EPOCH = date(2026, 1, 1)   # 固定纪元，保证同一天两次调用结果一致
+
+
+def today_str(day=None):
+    """归一为 'YYYY-MM-DD' 字符串；day 可为 None/date/datetime/字符串"""
+    if day is None:
+        day = datetime.now()
+    if isinstance(day, datetime):
+        return day.strftime("%Y-%m-%d")
+    if isinstance(day, date):
+        return day.strftime("%Y-%m-%d")
+    return str(day)
+
+
+def day_index_for(day_str):
+    """日期字符串距离固定纪元的天数；解析失败退化为稳定 hash（仅兜底）"""
+    try:
+        d = datetime.strptime(today_str(day_str), "%Y-%m-%d").date()
+        return (d - _EPOCH).days
+    except Exception:
+        return abs(hash(day_str)) % (2 ** 31)
+
+
+def pick_words(words, day=None, count=10):
+    """按日期取『连续 N 词』：每天起点前进 N 位、对词表总长取模。
+
+    - 同一天重复调用返回同一批词（date 种子确定性）；
+    - 一日内不重复（count 不超过总长时窗口内天然无重复）；
+    - 全表约 ceil(total/count) 天跑完一轮后轮转（默认词库 2607 词 × 10/天 ≈ 261 天）。
+    """
+    total = len(words)
+    if total <= 0:
+        return []
+    count = max(1, min(int(count), total))
+    ds = today_str(day)
+    start = (day_index_for(ds) * count) % total
+    return [words[(start + i) % total] for i in range(count)]
+
+
+# ---------------------------------------------------------------------------
+# 本地进度：跟随 settings 的语义放 exe 旁（words_progress.json），跨日自动重置
+# ---------------------------------------------------------------------------
+_EMPTY_PROGRESS = {"date": "", "pushed": False, "words": []}
+
+
+def load_progress(path):
+    """读取进度文件；不存在/损坏回退为空进度。"""
+    base = dict(_EMPTY_PROGRESS)
+    p = Path(path)
+    if not p.exists():
+        return base
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return base
+    if not isinstance(data, dict):
+        return base
+    words = data.get("words") or []
+    if not isinstance(words, list):
+        words = []
+    return {
+        "date": str(data.get("date") or ""),
+        "pushed": bool(data.get("pushed")),
+        "words": [dict(w) for w in words if isinstance(w, dict)],
+    }
+
+
+def save_progress(path, progress):
+    """写进度文件（path 由 main 提供 exe 旁的完整路径）"""
+    Path(path).write_text(
+        json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def pushed_today(progress, day=None):
+    """当天是否已推送（date 与今日一致且 pushed 为真且留有词）"""
+    ds = today_str(day)
+    return (progress.get("date") == ds and bool(progress.get("pushed"))
+            and bool(progress.get("words")))
+
+
+def plan_words(words, progress, day=None, count=10):
+    """推进"每日一次"逻辑：已推 → 原样返回今日词；未推 → 选词并写新进度。
+
+    返回 (今日词列表, 新进度)。纯函数，不落盘；写盘由调用方负责。
+    """
+    prog = dict(progress)
+    ds = today_str(day)
+    if pushed_today(prog, ds):
+        return list(prog["words"]), prog
+    sel = pick_words(words, ds, count)
+    prog = {"date": ds, "pushed": True, "words": sel}
+    return sel, prog
+
+
+# ---------------------------------------------------------------------------
+# 词卡弹窗（暗色玻璃统一风格；标题不含宠物名）
+# ---------------------------------------------------------------------------
+class WordCardDialog(QDialog):
+    """滚动词卡：单词加粗 + 音标灰色 + 中文释义，有例句则展示例句。
+
+    非模态展示（由 main 调 show()），窗口置顶但 WA_ShowWithoutActivating，
+    弹出来不抢用户当前窗口焦点；尺寸参考 PetCenter：内容最小宽度兜底、
+    禁用横向滚动、显示时夹回屏幕内。
+    """
+
+    def __init__(self, words, title="每日单词", parent=None):
+        super().__init__(parent)
+        self._words = [dict(w) for w in words]
+        self.setWindowTitle(title)
+        self.setMinimumWidth(340)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(10)
+
+        head = QLabel("📖 " + title)
+        head.setStyleSheet(
+            "font-size: 16px; font-weight: bold; color: #F0F0F6; background: transparent;"
+        )
+        outer.addWidget(head)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        body = QVBoxLayout(container)
+        body.setContentsMargins(2, 2, 10, 2)
+        body.setSpacing(4)
+
+        if not self._words:
+            empty = QLabel("今天没有可展示的词喵~")
+            empty.setWordWrap(True)
+            body.addWidget(empty)
+        else:
+            for i, w in enumerate(self._words):
+                self._append_word_row(body, w)
+                if i < len(self._words) - 1:
+                    sep = QFrame()
+                    sep.setFrameShape(QFrame.Shape.HLine)
+                    sep.setStyleSheet(
+                        "background: #3A3A46; border: none; max-height: 1px;"
+                    )
+                    body.addSpacing(2)
+                    body.addWidget(sep)
+                    body.addSpacing(2)
+        body.addStretch(1)
+
+        scroll.setWidget(container)
+        # 词行文字按深色主题配色（亮字灰标），容器必须给深色底，否则浅底浅字不可读
+        container.setStyleSheet("background-color: #23232E;")
+        scroll.viewport().setStyleSheet("background-color: #23232E;")
+        outer.addWidget(scroll, 1)
+
+        btns = QHBoxLayout()
+        done = QPushButton("今天先这样")
+        done.setDefault(True)
+        done.clicked.connect(self.accept)
+        btns.addStretch()
+        btns.addWidget(done)
+        outer.addLayout(btns)
+
+        self._fit_geometry(scroll, container)
+
+    # ---------- 词行 ----------
+    def _append_word_row(self, layout, w):
+        word = html.escape(w.get("word") or "")
+        ph = html.escape(w.get("phonetic") or "")
+        meaning = html.escape(w.get("meaning") or "")
+        example = w.get("example")
+        if isinstance(example, str):
+            example = html.escape(example.strip())
+
+        l1 = QLabel(
+            f'<span style="font-size:16px;font-weight:600;color:#F0F0F6;">{word}</span>'
+            f' <span style="font-size:13px;color:#8E8E9E;">{ph}</span>'
+        )
+        l1.setTextFormat(Qt.TextFormat.RichText)
+        l1.setWordWrap(True)
+        layout.addWidget(l1)
+
+        if meaning:
+            lm = QLabel(
+                f'<span style="font-size:13px;color:#E8E8F0;">{meaning}</span>'
+            )
+            lm.setTextFormat(Qt.TextFormat.RichText)
+            lm.setWordWrap(True)
+            layout.addWidget(lm)
+
+        if example:
+            le = QLabel(
+                f'<span style="font-size:12px;color:#9A9AA8;font-style:italic;">'
+                f"例：{example}</span>"
+            )
+            le.setTextFormat(Qt.TextFormat.RichText)
+            le.setWordWrap(True)
+            layout.addWidget(le)
+
+    # ---------- 尺寸适配（内容最小宽度兜底 / 不横向滚动 / 高度封顶） ----------
+    def _fit_geometry(self, scroll, container):
+        try:
+            screen = QApplication.primaryScreen().availableGeometry()
+        except Exception:
+            screen = None
+        try:
+            body = container.layout()
+            body.activate()
+            need_w = container.minimumSizeHint().width()
+            vbar_w = scroll.verticalScrollBar().sizeHint().width() or 12
+            limit = max(340, (screen.width() - 40)) if screen else 1200
+            fit_w = max(int(need_w) + vbar_w + 6, 340)
+            fit_w = min(fit_w, limit)
+
+            n = len(self._words)
+            est_h = 96 + n * 54 + 40                # 顶栏+每词+按钮的粗估
+            cap_h = min(int(screen.height() * 0.85), 640) if screen else 640
+            h = max(240, min(est_h, cap_h))
+            if screen and screen.height() - 20 < h:
+                h = max(200, screen.height() - 20)
+
+            self.setMinimumWidth(fit_w)
+            self.resize(min(fit_w + 24, (screen.width() - 20) if screen else fit_w + 24), h)
+        except Exception:
+            pass
+
+    def clamp_to_screen(self):
+        """把窗口夹回屏幕内（参考 PetCenter 经验）；showEvent 与 post-show move 后均需调用"""
+        try:
+            parent = self.parentWidget()
+            scr = (parent.screen() if (parent and parent.screen())
+                   else QApplication.primaryScreen())
+            ag = scr.availableGeometry()
+            g = self.geometry()
+            if g.right() > ag.right():
+                g.moveRight(ag.right())
+            if g.left() < ag.left():
+                g.moveLeft(ag.left())
+            if g.bottom() > ag.bottom():
+                g.moveBottom(ag.bottom())
+            if g.top() < ag.top():
+                g.moveTop(ag.top())
+            self.setGeometry(g)
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.clamp_to_screen()
+
+    # 供测试/回看使用
+    @property
+    def words(self):
+        return list(self._words)
