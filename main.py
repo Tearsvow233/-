@@ -46,6 +46,7 @@ from reminder_parser import parse_reminder, describe as describe_reminder
 from datetime import datetime, timedelta
 import resources_rc  # noqa: F401  注册 Qt 资源（:/check.png）
 import word_push as wp   # 每日英语单词推送（词库/选词/进度/词卡）
+import pet_hiss          # 哈气动画（60s 未点击触发，pet_drag 单击分支调用）
 
 # 资源路径：区分"开发环境"和"打包成 exe 后"两种情况
 # - 打包后(exe)：素材被打进 exe 内部临时目录 sys._MEIPASS，只读
@@ -145,7 +146,7 @@ def install_crash_hook():
     sys.excepthook = _hook
 
 
-wp.LOG_HOOK = log   # word_push 的发音降级/夹屏失败等消息进统一日志
+wp.LOG_HOOK = pet_hiss.LOG_HOOK = log   # word_push/pet_hiss 的日志进统一日志
 
 
 # ---------- 聊天文案 ----------
@@ -1146,8 +1147,7 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         # （分钟级循环定时器，成本≈0，静默模式也生效）
         self.custom_reminder_timers = {}   # idx -> QTimer
 
-        # 每日单词推送：60s 巡检，未规划先选词落盘，到点分批弹小气泡卡（独立于入睡守卫）
-        self._word_card = None            # 正在展示的回看词卡（None=没有）
+        self._word_card = None            # 每日单词回看词卡（None=没有）
         self._word_bubble = None          # 正在展示的分批小气泡卡
         self._word_warned = False         # 词库缺失时气泡只提示一次
         self._word_menu_action = None     # 托盘「今日单词」QAction（make_tray 后引用）

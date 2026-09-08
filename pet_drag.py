@@ -11,6 +11,7 @@ import traceback
 from PySide6.QtCore import Qt, QTimer
 
 from drag_physics import DragPhysics
+import pet_hiss
 
 
 class DragMixin:
@@ -107,7 +108,9 @@ class DragMixin:
             # 原地没动 = 单击 → 触发反应
             # 但睡眠中发起的点击（含凑满 3 次刚唤醒那一下）不做普通反应
             if not was_sleep_press:
-                self.start_react()
+                # 超过 60s 没点过猫：本次点击改播哈气动画（pet_hiss 门控）
+                if not pet_hiss.try_play(self):
+                    self.start_react()
         self.last_touch_ts = time.time()
         del self._press_pos
 
