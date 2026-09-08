@@ -32,3 +32,6 @@ assets/_preview2/
 .vscode/
 .probe/
 .git-rewrite/
+
+# 本地虚拟环境
+.venv/
