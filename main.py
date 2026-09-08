@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtGui import QAction, QPixmap, QTransform, QIcon, QPainter, QImageReader
+from PySide6.QtGui import QAction, QPixmap, QTransform, QIcon, QPainter, QImageReader, QBitmap, QImage
 from PySide6.QtWidgets import (
     QApplication, QLabel, QMenu, QDialog, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLineEdit, QSpinBox, QCheckBox, QPushButton,
@@ -1536,7 +1536,12 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
 
         # 散步序列 = pace 完整踱步剧本 + 镜像收尾（构造逻辑见 pet_walk.py）
         pace_frames = self.action_frames.get("pace", [])
-        _mir = lambda pm: pm.transformed(QTransform().scale(-1, 1))
+        # 镜像走 QImage 层（transformed 位图配手工遮罩有平台坑，见 _build_mask）
+        def _mir(pm):
+            img = pm.toImage().transformed(QTransform().scale(-1, 1))
+            out = QPixmap.fromImage(img)
+            out.setDevicePixelRatio(pm.devicePixelRatioF())
+            return out
         self.walk_seq, self.walk_seq_mir = pet_walk.build_walk_seq(pace_frames, _mir)
         log(f"散步序列: {len(self.walk_seq)} 帧（pace 剧本 + 镜像收尾）")
 
@@ -1546,6 +1551,20 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         if collected:
             self._schedule_cache_build(cdir, collected)
 
+    @staticmethod
+    def _build_mask(pm):
+        """由 alpha 手工构建 1-bit 遮罩。不用 pm.mask()：其平台位图对镜像内容
+        会被 Windows 窗体区域错误裁切（tools/probe_mask_fix.py 矩阵验证）。"""
+        img = pm.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        flat = QImage(img.size(), QImage.Format.Format_ARGB32)
+        flat.fill(Qt.GlobalColor.black)
+        qp = QPainter(flat)
+        qp.drawImage(0, 0, img)
+        qp.end()
+        gray = flat.convertToFormat(QImage.Format.Format_Grayscale8)
+        mono = gray.createMaskFromColor(0, Qt.MaskMode.MaskOutColor)  # 非纯黑→1
+        return QBitmap.fromImage(mono)
+
     def set_frame(self, pm):
         """换帧统一入口：同时更新贴图和鼠标遮罩。
         遮罩让透明区域点击穿透——猫矩形窗口的空白角落不会挡住下面的软件。
@@ -1553,7 +1572,7 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         self.setPixmap(pm)
         mask = self._mask_cache.get(id(pm))
         if mask is None:
-            mask = pm.mask()  # 由 alpha 通道生成
+            mask = self._build_mask(pm)
             if mask is not None:
                 self._mask_cache[id(pm)] = mask
         if mask is not None:
