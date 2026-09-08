@@ -12,11 +12,12 @@
 """
 import html
 import json
+import random
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QVBoxLayout, QWidget,
@@ -116,11 +117,16 @@ def pick_words(words, day=None, count=10):
 # ---------------------------------------------------------------------------
 # 本地进度：跟随 settings 的语义放 exe 旁（words_progress.json），跨日自动重置
 # ---------------------------------------------------------------------------
-_EMPTY_PROGRESS = {"date": "", "pushed": False, "words": []}
+_EMPTY_PROGRESS = {"date": "", "pushed": False, "words": [],
+                   "batch_done": 0, "last_push_ts": 0.0}
 
 
 def load_progress(path):
-    """读取进度文件；不存在/损坏回退为空进度。"""
+    """读取进度文件；不存在/损坏回退为空进度。
+
+    旧格式迁移：无 batch_done 字段且当天已推 → 视为全部批次已推完
+    （旧版一次推完整天，语义等价）；未推过 → batch_done=0。
+    """
     base = dict(_EMPTY_PROGRESS)
     p = Path(path)
     if not p.exists():
@@ -134,10 +140,20 @@ def load_progress(path):
     words = data.get("words") or []
     if not isinstance(words, list):
         words = []
+    done = data.get("batch_done")
+    if not isinstance(done, int) or done < 0:
+        done = (len(words) + BATCH_SIZE - 1) // BATCH_SIZE \
+            if (data.get("pushed") and words) else 0
+    try:
+        last_ts = float(data.get("last_push_ts") or 0.0)
+    except (TypeError, ValueError):
+        last_ts = 0.0
     return {
         "date": str(data.get("date") or ""),
         "pushed": bool(data.get("pushed")),
         "words": [dict(w) for w in words if isinstance(w, dict)],
+        "batch_done": done,
+        "last_push_ts": last_ts,
     }
 
 
@@ -156,17 +172,143 @@ def pushed_today(progress, day=None):
 
 
 def plan_words(words, progress, day=None, count=10):
-    """推进"每日一次"逻辑：已推 → 原样返回今日词；未推 → 选词并写新进度。
+    """推进"每日一次"逻辑：已规划 → 原样返回今日词；未规划 → 选词并写新进度。
 
     返回 (今日词列表, 新进度)。纯函数，不落盘；写盘由调用方负责。
+    新进度带批次字段（batch_done=0 / last_push_ts=0），分批推送从第 0 批开始。
     """
     prog = dict(progress)
     ds = today_str(day)
     if pushed_today(prog, ds):
         return list(prog["words"]), prog
     sel = pick_words(words, ds, count)
-    prog = {"date": ds, "pushed": True, "words": sel}
+    prog = {"date": ds, "pushed": True, "words": sel,
+            "batch_done": 0, "last_push_ts": 0.0}
     return sel, prog
+
+
+# ---------------------------------------------------------------------------
+# 分批推送：当天词量切成 2 词一批，09:00~20:30 间到点弹小气泡卡
+# ---------------------------------------------------------------------------
+BATCH_SIZE = 2            # 每批词数（小气泡卡一次只学得动这么多）
+MIN_GAP_SEC = 25 * 60     # 两批之间的最小间隔（补推防连发）
+_WINDOW_START = 9 * 60            # 推送窗口起点 09:00（分钟）
+_WINDOW_END = 20 * 60 + 30        # 推送窗口终点 20:30
+
+
+def batches_for(words, size=BATCH_SIZE):
+    """把当天词列表切成若干批（每批 size 个，最后一批可能不足）"""
+    ws = list(words)
+    return [ws[i:i + size] for i in range(0, len(ws), size)]
+
+
+def batch_times(day_str, n):
+    """第 i 批的计划推送时刻（datetime 列表，同一天重复调用结果一致）。
+
+    均匀分布在 09:00~20:30，±15 分钟确定性抖动（日期+批数做种子），
+    避免每天准点机械弹窗。
+    """
+    d = datetime.strptime(today_str(day_str), "%Y-%m-%d").date()
+    rng = random.Random(day_index_for(day_str) * 131 + int(n))
+    out = []
+    for i in range(max(1, int(n))):
+        mid = _WINDOW_START + (_WINDOW_END - _WINDOW_START) * (i + 0.5) / n
+        t = int(round(mid + rng.uniform(-15, 15)))
+        t = max(_WINDOW_START, min(_WINDOW_END, t))
+        out.append(datetime.combine(d, dtime(t // 60, t % 60)))
+    return out
+
+
+def due_batch(progress, now=None):
+    """当前是否到点该推下一批；到点返回批次下标，否则 None。
+
+    条件：当天已规划、还有未推批次、计划时刻已过、距上批 ≥ MIN_GAP_SEC。
+    错过的批次按“尽快补推”处理（受最小间隔限制，不会连发）。
+    """
+    if now is None:
+        now = datetime.now()
+    if not pushed_today(progress):
+        return None
+    batches = batches_for(progress.get("words") or [])
+    done = int(progress.get("batch_done") or 0)
+    if not batches or done >= len(batches):
+        return None
+    if now < batch_times(progress["date"], len(batches))[done]:
+        return None
+    last = float(progress.get("last_push_ts") or 0.0)
+    if last and now.timestamp() - last < MIN_GAP_SEC:
+        return None
+    return done
+
+
+def any_pushed_today(progress, day=None):
+    """当天是否已推出过至少一批（托盘「今日单词」可用性）"""
+    return pushed_today(progress, day) and int(progress.get("batch_done") or 0) > 0
+
+
+def words_pushed_so_far(progress):
+    """当天已推出批次的词（回看用，按推送顺序展开）"""
+    done = int(progress.get("batch_done") or 0)
+    return [w for b in batches_for(progress.get("words") or [])[:done] for w in b]
+
+
+# ---------------------------------------------------------------------------
+# 发音：优先 QtTextToSpeech（离线 SAPI），兜底 PowerShell System.Speech
+# ---------------------------------------------------------------------------
+LOG_HOOK = None   # main 注入 log()；未注入时降级 print 到 stderr
+_tts = None
+_tts_failed = False
+
+
+def _log(msg):
+    if LOG_HOOK is not None:
+        LOG_HOOK(msg)
+    else:
+        print(msg, file=sys.stderr)
+
+
+def speak_word(word):
+    """朗读单词；全部路径不可用则记日志并返回 False（不打扰用户）。"""
+    global _tts, _tts_failed
+    w = (word or "").strip()
+    if not w:
+        return False
+    if not _tts_failed:
+        try:
+            if _tts is None:
+                from PySide6.QtTextToSpeech import QTextToSpeech
+                _tts = QTextToSpeech()
+            _tts.say(w)
+            return True
+        except Exception as exc:
+            _tts_failed = True
+            _log(f"[word] QtTextToSpeech 不可用，转 PowerShell 兜底：{exc}")
+    try:
+        import subprocess
+        safe = w.replace("'", "''")
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Add-Type -AssemblyName System.Speech; "
+             f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{safe}')"],
+            creationflags=0x08000000)   # CREATE_NO_WINDOW
+        return True
+    except Exception as exc:
+        _log(f"[word] 发音兜底也失败：{exc}")
+        return False
+
+
+def _clickable_word_html(word):
+    """单词的富文本：点击触发发音（linkActivated → say:协议）"""
+    esc = html.escape(word)
+    return (f'<a href="say:{esc}" style="color:#7FD8FF;text-decoration:none;">'
+            f'<span style="font-size:16px;font-weight:600;">{esc}</span></a>'
+            f' <span style="font-size:11px;color:#5F5F70;">🔊</span>')
+
+
+def _on_say_link(href):
+    """词卡/气泡里的 say: 链接统一入口"""
+    if isinstance(href, str) and href.startswith("say:"):
+        speak_word(html.unescape(href[4:]))
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +386,6 @@ class WordCardDialog(QDialog):
 
     # ---------- 词行 ----------
     def _append_word_row(self, layout, w):
-        word = html.escape(w.get("word") or "")
         ph = html.escape(w.get("phonetic") or "")
         meaning = html.escape(w.get("meaning") or "")
         example = w.get("example")
@@ -252,10 +393,13 @@ class WordCardDialog(QDialog):
             example = html.escape(example.strip())
 
         l1 = QLabel(
-            f'<span style="font-size:16px;font-weight:600;color:#F0F0F6;">{word}</span>'
-            f' <span style="font-size:13px;color:#8E8E9E;">{ph}</span>'
+            _clickable_word_html(w.get("word") or "")
+            + f' <span style="font-size:13px;color:#8E8E9E;">{ph}</span>'
         )
         l1.setTextFormat(Qt.TextFormat.RichText)
+        l1.setOpenExternalLinks(False)
+        l1.linkActivated.connect(_on_say_link)
+        l1.setToolTip("点击单词听发音")
         l1.setWordWrap(True)
         layout.addWidget(l1)
 
@@ -328,6 +472,84 @@ class WordCardDialog(QDialog):
         self.clamp_to_screen()
 
     # 供测试/回看使用
+    @property
+    def words(self):
+        return list(self._words)
+
+
+# ---------------------------------------------------------------------------
+# 小气泡词卡：一批 1~2 词，猫头顶弹出，45s 自动关闭
+# ---------------------------------------------------------------------------
+class WordBubble(QDialog):
+    """分批推送用的小词卡：单词(可点发音)+音标+释义(+例句)，不抢焦点。
+
+    与 WordCardDialog 的差别：无滚动区、固定小尺寸、自动关闭——
+    出现在猫旁边像猫"叼"出来的一张小卡片，看完即走。
+    """
+
+    AUTO_CLOSE_MS = 45 * 1000
+
+    def __init__(self, words, batch_no=1, batch_total=1, parent=None):
+        super().__init__(parent)
+        self._words = [dict(w) for w in words]
+        self.setWindowTitle(f"单词时间 · {batch_no}/{batch_total}")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(6)
+
+        head = QLabel(f"📖 单词时间 <span style='color:#8E8E9E;font-size:11px;'>"
+                      f"第 {batch_no}/{batch_total} 批 · 点单词听发音</span>")
+        head.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #F0F0F6; background: transparent;"
+        )
+        head.setTextFormat(Qt.TextFormat.RichText)
+        outer.addWidget(head)
+
+        for i, w in enumerate(self._words):
+            self._append_word_row(outer, w)
+            if i < len(self._words) - 1:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.HLine)
+                sep.setStyleSheet("background: #3A3A46; border: none; max-height: 1px;")
+                outer.addWidget(sep)
+
+        self.setMinimumWidth(300)
+        self.setStyleSheet("background-color: #23232E;")
+        self.adjustSize()
+        cap_h = 260
+        if self.height() > cap_h:
+            self.resize(self.width(), cap_h)
+
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self.accept)
+        self._auto_timer.start(self.AUTO_CLOSE_MS)
+
+    _append_word_row = WordCardDialog._append_word_row   # 词行渲染复用
+
+    def clamp_to_screen(self):
+        """弹到猫头顶后可能越界，夹回屏幕内"""
+        try:
+            parent = self.parentWidget()
+            scr = (parent.screen() if (parent and parent.screen())
+                   else QApplication.primaryScreen())
+            ag = scr.availableGeometry()
+            g = self.geometry()
+            if g.right() > ag.right():
+                g.moveRight(ag.right())
+            if g.left() < ag.left():
+                g.moveLeft(ag.left())
+            if g.bottom() > ag.bottom():
+                g.moveBottom(ag.bottom())
+            if g.top() < ag.top():
+                g.moveTop(ag.top())
+            self.setGeometry(g)
+        except Exception as exc:
+            _log(f"[word] 气泡夹屏失败：{exc}")
+
     @property
     def words(self):
         return list(self._words)

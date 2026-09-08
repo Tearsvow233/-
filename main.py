@@ -145,6 +145,9 @@ def install_crash_hook():
     sys.excepthook = _hook
 
 
+wp.LOG_HOOK = log   # word_push 的发音降级/夹屏失败等消息进统一日志
+
+
 # ---------- 聊天文案 ----------
 # 按类别分组；性格（personality）决定各类别的出现权重
 CHATTER_GROUPS = {
@@ -765,9 +768,9 @@ class PetCenter(QDialog):
         self.word_spin.setSuffix(" 词/天")
         form.addRow("每日词量", self.word_spin)
 
-        word_note = QLabel("启动约 3 分钟后推一次；当天错过则等你空闲时补推。"
-                           "睡着时被推会先醒过来教词，词卡关掉后继续睡。"
-                           "推送不占用网络，静默模式下同样生效。")
+        word_note = QLabel("当天词量分小批（每批 2 个），09:00~20:30 到点在猫头顶弹"
+                           "小气泡卡，45 秒自动关；点单词可听发音。"
+                           "睡着时被推会先醒过来教词，卡片关掉后继续睡。")
         word_note.setStyleSheet("color: #9A9AA8; font-size: 11px;")
         word_note.setWordWrap(True)
         form.addRow("", word_note)
@@ -1143,17 +1146,15 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         # （分钟级循环定时器，成本≈0，静默模式也生效）
         self.custom_reminder_timers = {}   # idx -> QTimer
 
-        # 每日单词推送：启动后约 3 分钟单次窗口 + 45s 空闲巡检（当天未推才推；
-        # 独立于入睡守卫，睡着被推走"唤醒→教词→睡回"路径）
-        self._word_card = None            # 正在展示的今日词卡（None=没有）
+        # 每日单词推送：60s 巡检，未规划先选词落盘，到点分批弹小气泡卡（独立于入睡守卫）
+        self._word_card = None            # 正在展示的回看词卡（None=没有）
+        self._word_bubble = None          # 正在展示的分批小气泡卡
         self._word_warned = False         # 词库缺失时气泡只提示一次
         self._word_menu_action = None     # 托盘「今日单词」QAction（make_tray 后引用）
-        self.word_start_timer = QTimer(self)
-        self.word_start_timer.setSingleShot(True)
-        self.word_start_timer.timeout.connect(self._word_startup_tick)
-        self.word_idle_timer = QTimer(self)
-        self.word_idle_timer.setInterval(45 * 1000)
-        self.word_idle_timer.timeout.connect(self._word_idle_tick)
+        self._app_start_ts = time.time()  # 启动 3 分钟内不推词，避免开机糊脸
+        self.word_timer = QTimer(self)
+        self.word_timer.setInterval(60 * 1000)
+        self.word_timer.timeout.connect(self._word_tick)
 
         # 入睡状态机：空闲超时入睡（sleep_after_min），仅 normal 模式生效
         self.last_touch_ts = time.time()   # 最近一次用户互动时间戳
@@ -2181,28 +2182,22 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
 
     # ---------- 每日英语单词推送（独立于入睡守卫） ----------
     def setup_word_push(self):
-        """按设置启停每日单词调度。
-
-        触发窗口：① 启动后约 3 分钟单次；② 45s 空闲巡检（当天未推、系统空闲
-        ≥120s 且距离上次互动 ≥120s 时触发）。静默模式沿用提醒语义：动画停、
-        推送照常生效，不额外制造定时器负担。
-        """
-        self.word_start_timer.stop()
-        self.word_idle_timer.stop()
+        """按设置启停每日单词调度：60s 巡检，09:00~20:30 间到点分批弹小气泡卡。
+        静默模式沿用提醒语义：动画停、推送照常生效。"""
+        self.word_timer.stop()
         self._word_warned = False   # 重新启用/重设时允许再次提示
         if not self.settings.get("word_enabled", True):
             return
-        self.word_start_timer.start(3 * 60 * 1000)
-        self.word_idle_timer.start(45 * 1000)
+        self.word_timer.start()
         self._refresh_word_menu()
-        log(f"每日单词调度已启用 · 词量={self.settings.get('word_count', 10)}")
+        log(f"每日单词调度已启用 · 词量={self.settings.get('word_count', 10)}/天"
+            f" · 每批{wp.BATCH_SIZE}词")
 
     def _word_pushed_today(self):
-        """当天是否已推（读 exe 旁进度文件，date 跨日自动不命中）"""
-        return wp.pushed_today(wp.load_progress(WORDS_PROGRESS_FILE))
+        """当天是否已有词可回看（至少推出过一批）"""
+        return wp.any_pushed_today(wp.load_progress(WORDS_PROGRESS_FILE))
 
     def _refresh_word_menu(self):
-        """托盘「今日单词」仅当天已推时可用（推送成功/设置变更后刷新）"""
         act = getattr(self, "_word_menu_action", None)
         if act is None:
             return
@@ -2213,48 +2208,39 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
 
     def _word_card_visible(self):
         try:
-            return self._word_card is not None and self._word_card.isVisible()
+            for w_ in (self._word_card, self._word_bubble):
+                if w_ is not None and w_.isVisible():
+                    return True
         except RuntimeError:        # 词卡已被销毁
             self._word_card = None
-            return False
+            self._word_bubble = None
+        return False
 
     def _word_modal_busy(self):
-        """用户在聊天/设置等模态弹窗中，或词卡已开着 → 本次跳过、等下一窗口"""
+        """聊天/设置等模态中，或词卡已开着 → 本次跳过、等下一窗口"""
         if self._word_card_visible():
             return True
         app = QApplication.instance()
         return app is not None and app.activeModalWidget() is not None
 
-    def _word_startup_tick(self):
-        """触发窗口 ①：启动后约 3 分钟推一次（当天未推才推）"""
+    def _word_tick(self):
+        # 60s 巡检：未规划先选词落盘；到点且间隔足够则推下一批
         if not self.settings.get("word_enabled", True):
             return
-        if self._word_pushed_today():
+        if time.time() - self._app_start_ts < 180:
             return
         if self._word_modal_busy():
             return
-        self._try_push_daily_words("startup")
+        prog = wp.load_progress(WORDS_PROGRESS_FILE)
+        if not wp.pushed_today(prog):
+            prog = self._plan_today_words(prog)
+            if prog is None:
+                return
+        idx = wp.due_batch(prog)
+        if idx is not None:
+            self._push_word_batch(prog, idx)
 
-    def _word_idle_tick(self):
-        """触发窗口 ②：空闲巡检（复用 _system_idle_sec / last_touch_ts 语义）"""
-        if not self.settings.get("word_enabled", True):
-            return
-        if self._word_pushed_today():
-            return
-        if self._word_modal_busy():
-            return
-        sys_idle = self._system_idle_sec()
-        touch_gap = time.time() - self.last_touch_ts
-        if sys_idle >= 120 and touch_gap >= 120:
-            self._try_push_daily_words("idle")
-
-    def _try_push_daily_words(self, reason):
-        """当天未推的核心入口：加载词库 → 选词落进度 →（睡着则唤醒）→ 弹词卡。
-
-        词库缺失/为空：气泡提示一次后停调度，不崩溃。
-        """
-        if self._word_card_visible():
-            return False
+    def _plan_today_words(self, prog):
         words = wp.load_words()
         if not words:
             if not self._word_warned:
@@ -2262,28 +2248,44 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
                 self.bubble.say("单词库没装上喵…（词库文件缺失）",
                                 (self.x(), self.y(), self.width()), ms=3500)
                 log("[word] 词库缺失/为空，每日单词调度停止")
-                self.word_start_timer.stop()
-                self.word_idle_timer.stop()
-            return False
+                self.word_timer.stop()
+            return None
         try:
             count = max(5, min(20, int(self.settings.get("word_count", 10))))
-        except Exception:
+        except (TypeError, ValueError):
             count = 10
-        prog = wp.load_progress(WORDS_PROGRESS_FILE)
-        if wp.pushed_today(prog):
-            return False
-        day_words, new_prog = wp.plan_words(words, prog, None, count)
+        _day_words, new_prog = wp.plan_words(words, prog, None, count)
         wp.save_progress(WORDS_PROGRESS_FILE, new_prog)
+        log(f"[word] 今日词单已规划 · {len(_day_words)} 词")
+        return new_prog
+
+    def _push_word_batch(self, prog, idx):
+        """弹一批小气泡卡：睡着先唤醒；落 batch_done/last_push_ts 进度"""
+        batches = wp.batches_for(prog["words"])
+        if idx >= len(batches):
+            return
+        prog = dict(prog)
+        prog["batch_done"] = idx + 1
+        prog["last_push_ts"] = time.time()
+        wp.save_progress(WORDS_PROGRESS_FILE, prog)
         self._refresh_word_menu()
-        log(f"[word] 推送[{reason}] {len(day_words)} 词")
         was_sleeping = self._is_sleeping()
         if was_sleeping:
             self._word_wake_look()
-        self._show_word_card(day_words, title="每日单词", was_sleeping=was_sleeping)
-        return True
+        bubble = wp.WordBubble(batches[idx], idx + 1, len(batches))
+        self._word_bubble = bubble
+        bubble.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        bubble.finished.connect(lambda _res: self._on_word_card_closed(was_sleeping))
+        bubble.show()
+        if self.isVisible():
+            g = bubble.frameGeometry()
+            g.moveCenter(self.geometry().center())
+            g.moveTop(self.geometry().top() - g.height() - 12)
+            bubble.move(g.topLeft())
+            bubble.clamp_to_screen()
+        log(f"[word] 推送第 {idx + 1}/{len(batches)} 批 · {len(batches[idx])} 词")
 
     def _show_word_card(self, words, title, was_sleeping=False):
-        """非模态弹词卡；已有词卡打开时不叠开。关闭后按 was_sleeping 恢复睡眠画面"""
         if self._word_card_visible():
             return
         card = wp.WordCardDialog(words, title=title)
@@ -2292,8 +2294,6 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         card.finished.connect(lambda _res: self._on_word_card_closed(was_sleeping))
         card.show()
         if self.isVisible():
-            # 词卡放在小江正上方悬浮居中，再夹回屏幕内
-            # （post-show 的 move 不触发 showEvent，需显式补一次夹屏）
             g = card.frameGeometry()
             g.moveCenter(self.geometry().center())
             card.move(g.topLeft())
@@ -2302,6 +2302,7 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
 
     def _on_word_card_closed(self, was_sleeping):
         self._word_card = None
+        self._word_bubble = None
         if was_sleeping:
             self._restore_sleep_after_word()
 
@@ -2338,14 +2339,14 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         log("[word] 词卡关闭，恢复睡眠画面")
 
     def open_today_words(self):
-        """托盘「今日单词」：当天已推则回看词卡（复用 WordCardDialog）"""
         prog = wp.load_progress(WORDS_PROGRESS_FILE)
-        if not wp.pushed_today(prog):
+        if not wp.any_pushed_today(prog):
             self.bubble.say("今天还没推过单词喵~",
                             (self.x(), self.y(), self.width()), ms=3000)
             return
         self.last_touch_ts = time.time()
-        self._show_word_card(prog["words"], title="今日单词", was_sleeping=False)
+        self._show_word_card(wp.words_pushed_so_far(prog),
+                             title="今日单词", was_sleeping=False)
 
     # ---------- 主动聊天 ----------
     def idle_chatter(self):
@@ -2569,7 +2570,6 @@ def make_tray(pet):
     quick_action.triggered.connect(pet.quick_reminder_input)
     word_action = QAction("📖 今日单词", menu)
     word_action.triggered.connect(pet.open_today_words)
-    # 仅当天已推送过才可回看；推送成功后由 pet._refresh_word_menu 置为可用
     word_action.setEnabled(pet._word_pushed_today())
     pet._word_menu_action = word_action
 
