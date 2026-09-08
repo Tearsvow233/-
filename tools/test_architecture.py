@@ -37,7 +37,8 @@ MAIN_PY_LINE_BUDGET = 2677  # 行数预算基线（2026-09-07 快照），只许
 PURE_LOGIC_MODULES = ["ai_chat.py", "reminder_parser.py", "action_scheduler.py"]
 
 # UI 层：允许用 Qt；纯逻辑层禁止 import 它们
-UI_MODULES = ["main.py", "word_push.py"]
+UI_MODULES = ["main.py", "word_push.py",
+              "pet_drag.py", "pet_vision.py", "pet_agent_link.py"]
 
 # 生产代码 = UI 层 + 纯逻辑层（tools/ 下的测试与工具脚本不受红线管辖）
 PRODUCTION_MODULES = UI_MODULES + PURE_LOGIC_MODULES

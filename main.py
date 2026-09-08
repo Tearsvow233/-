@@ -22,15 +22,17 @@ import json
 import time
 import shutil
 import action_scheduler
-from agent_link import AgentLink  # T9 外部 Agent 事件总线（纯逻辑，无 Qt 依赖）
-from drag_physics import DragPhysics  # T10 拖拽物理（纯逻辑，无 Qt 依赖）
-from proactive_vision import IdleDetector, dhash, process_allowed  # T8 主动行为（纯逻辑）
+# T8/T9/T10 的 Qt 集成层 Mixin（T5 行数预算：main.py 只做装配；
+# 纯逻辑层在 agent_link / drag_physics / proactive_vision）
+from pet_drag import DragMixin
+from pet_vision import VisionMixin, build_vision_form, collect_vision_values
+from pet_agent_link import AgentLinkMixin
 import random
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QBuffer, QByteArray, QIODevice
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QAction, QPixmap, QTransform, QIcon, QPainter, QImageReader
 from PySide6.QtWidgets import (
     QApplication, QLabel, QMenu, QDialog, QVBoxLayout, QHBoxLayout,
@@ -487,59 +489,6 @@ class ChatWorker(QThread):
         self.result_ready.emit(ans)
 
 
-class VisionWorker(QThread):
-    """T8：后台线程调视觉模型（截图 → 一句主动搭话），不卡 UI。"""
-    result_ready = Signal(object)   # str 或 None（None/出错 -> 静默放弃）
-
-    def __init__(self, ai, image_b64, prompt):
-        super().__init__()
-        self.ai = ai
-        self.image_b64 = image_b64
-        self.prompt = prompt
-
-    def run(self):
-        try:
-            ans = self.ai.reply_vision(self.image_b64, self.prompt)
-        except Exception:
-            ans = None
-        self.result_ready.emit(ans)
-
-
-def foreground_process_path():
-    """当前前台进程的可执行文件完整路径；取不到返回 None（非 Windows / 无权限）。
-
-    纯 ctypes，零新依赖；只在 Windows 上有意义。
-    """
-    if sys.platform != "win32":
-        return None
-    try:
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return None
-        pid = wintypes.DWORD(0)
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if not pid.value:
-            return None
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-        if not h:
-            return None
-        try:
-            buf = ctypes.create_unicode_buffer(1024)
-            size = wintypes.DWORD(1024)
-            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-                return buf.value
-            return None
-        finally:
-            kernel32.CloseHandle(h)
-    except Exception:
-        return None
-
-
 class ReminderParseWorker(QThread):
     """L3：后台线程调 LLM 把一句话解析成提醒 dict（不卡 UI）"""
     result_ready = Signal(object)   # dict | None
@@ -839,29 +788,8 @@ class PetCenter(QDialog):
         self.ai_model_edit.setPlaceholderText("模型名")
         form.addRow("模型", self.ai_model_edit)
 
-        self.vision_check = QCheckBox("主动观察（空闲时看一眼屏幕并搭话，隐私优先）")
-        self.vision_check.setChecked(bool(settings.get("proactive_vision", False)))
-        form.addRow("", self.vision_check)
-
-        self.vision_idle_spin = QSpinBox()
-        self.vision_idle_spin.setRange(3, 120)
-        self.vision_idle_spin.setValue(int(settings.get("vision_idle_min", 10)))
-        self.vision_idle_spin.setSuffix(" 分钟")
-        form.addRow("└ 静止多久才算空闲", self.vision_idle_spin)
-
-        self.vision_cool_spin = QSpinBox()
-        self.vision_cool_spin.setRange(5, 360)
-        self.vision_cool_spin.setValue(int(settings.get("vision_cooldown_min", 30)))
-        self.vision_cool_spin.setSuffix(" 分钟")
-        form.addRow("└ 搭话后冷却", self.vision_cool_spin)
-
-        self.vision_model_edit = QLineEdit(settings.get("ai_vision_model", ""))
-        self.vision_model_edit.setPlaceholderText("留空 = 用上面的模型（需支持图片）")
-        form.addRow("└ 视觉模型名", self.vision_model_edit)
-
-        self.vision_wl_edit = QLineEdit(", ".join(settings.get("vision_process_whitelist") or []))
-        self.vision_wl_edit.setPlaceholderText("允许被观察的前台应用，如：chrome, code, idea64")
-        form.addRow("└ 应用白名单", self.vision_wl_edit)
+        # T8 主动观察：控件在 pet_vision.build_vision_form（行数预算拆分）
+        self._vision_widgets = build_vision_form(form, settings)
 
         layout.addLayout(form)
 
@@ -983,14 +911,8 @@ class PetCenter(QDialog):
             "ai_api_key": self.ai_key_edit.text().strip(),
             "ai_base_url": self.ai_base_edit.text().strip() or "https://api.openai.com/v1",
             "ai_model": self.ai_model_edit.text().strip() or "gpt-4o-mini",
-            # T8 主动观察（白名单解析：逗号/空格分隔，去空）
-            "proactive_vision": self.vision_check.isChecked(),
-            "vision_idle_min": self.vision_idle_spin.value(),
-            "vision_cooldown_min": self.vision_cool_spin.value(),
-            "ai_vision_model": self.vision_model_edit.text().strip(),
-            "vision_process_whitelist": [w for w in
-                self.vision_wl_edit.text().replace("，", ",").replace(" ", ",").split(",")
-                if w.strip()],
+            # T8 主动观察（收集逻辑在 pet_vision.collect_vision_values）
+            **collect_vision_values(self._vision_widgets),
             # 每日单词
             "word_enabled": self.word_check.isChecked(),
             "word_count": self.word_spin.value(),
@@ -1151,7 +1073,7 @@ class TestButton(QWidget):
 
 
 # ---------- 主窗口：小江本体 ----------
-class PetWindow(QLabel):
+class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
     # T9：AgentLink 在 daemon 线程触发，emit() 跨线程安全；slot 在主线程跑
     agent_state = Signal(str, dict)  # (state, {agent: (state, ts)})
 
@@ -1206,24 +1128,10 @@ class PetWindow(QLabel):
         self.chatter_timer = QTimer(self); self.chatter_timer.setSingleShot(True)
         self.chatter_timer.timeout.connect(self.idle_chatter)
 
-        # T10 拖拽物理：释放后 ~60fps 积分（甩抛/重力/反弹），落地即停
-        self._phys = DragPhysics()
-        self.physics_timer = QTimer(self)   # 16ms ≈ 60fps
-        self.physics_timer.timeout.connect(self._on_physics_tick)
-        self._phys_bounced = False          # 本次飞行是否弹跳过（落地播 recoil）
-
-        # T8 主动行为：定时截 9×8 缩略图做哈希，画面+人闲置才触发视觉搭话
-        self._vision = IdleDetector(
-            stable_ticks=max(1, int(self.settings.get("vision_idle_min", 10)
-                                    * 60 / max(5, self.settings.get("vision_check_sec", 60)))),
-            cooldown_sec=max(60, self.settings.get("vision_cooldown_min", 30) * 60),
-        )
-        self._vision_busy = False           # 视觉调用进行中（防重入）
-        self.vision_timer = QTimer(self)
-        self.vision_timer.timeout.connect(self._on_vision_tick)
-        if (self.settings.get("proactive_vision", False)
-                and self.settings.get("ai_enabled")):
-            self.vision_timer.start(max(5, self.settings.get("vision_check_sec", 60)) * 1000)
+        # T8/T9/T10 集成层初始化（实现分别在 pet_vision / pet_agent_link / pet_drag）
+        self._init_drag_physics()      # T10：甩抛/重力/反弹
+        self._init_vision()             # T8：截图哈希判闲置 → 视觉模型
+        self._init_agent_link(APP_DIR)  # T9：外部 Agent 事件总线（默认关）
 
         # 提醒：喝水/久坐等周期性提醒统一由 custom_reminder_timers 管理
         # （分钟级循环定时器，成本≈0，静默模式也生效）
@@ -1700,34 +1608,6 @@ class PetWindow(QLabel):
         return random.choices(texts, weights=ws, k=1)[0].format(name=self.name())
 
     # ---------- 新动作播放器 ----------
-    # ---------- T9：Agent Link 状态切换 ----------
-    def on_agent_state(self, state, agents):
-        """AgentLink 信号槽：把外部 Agent 聚合态映射到动作。
-        跑在主线程（Qt signal-slot 跨线程自动派发）。
-        idle / sleeping 不动 —— 留给现有调度器 / 入睡状态机。
-        """
-        if state in ("idle", "sleeping"):
-            return
-        mapping = self.settings.get("agent_link_to_action") or {}
-        action = mapping.get(state)
-        if not action:
-            return
-        if action not in self.action_frames:
-            log(f"[agent_link] 映射动作 {action} 不可用（无帧或未加载）")
-            return
-        # 不打断用户主动操作（drag / 拖拽中 / 反应链）
-        if self.state in ("drag", "react"):
-            return
-        log(f"[agent_link] {state} → 动作 {action}")
-        self.play_action(action)
-        if state == "error" and agents:
-            who = "、".join(agents.keys())[:30] or "外部 agent"
-            try:
-                self.bubble.say(f"{who} 好像遇到问题了…",
-                                (self.x(), self.y(), self.width()), ms=3000)
-            except Exception as e:
-                log(f"[agent_link] 气泡失败：{e}")
-
     def play_action(self, name):
         """播放一个动作序列；可被拖拽/点击/切模式打断"""
         frames = self.action_frames.get(name)
@@ -2496,112 +2376,6 @@ class PetWindow(QLabel):
         )
         self._launch_chat(cue, thinking_ms=0, record_cue=False)
 
-    # ---------- T8 proactive 主动行为（截图 → 哈希判闲置 → 视觉模型搭话）----------
-    # 提示词：只做"看一眼 + 一句话"，禁提问、限字数，别把主人隐私细节复述出来
-    _VISION_PROMPT = (
-        "主人面前这个画面已经停留很久了。你看一眼截图，"
-        "用一句话可爱地关心或调侃一下主人正在做的事（比如该休息了/又在肝代码），"
-        "不要复述画面里的具体内容和个人信息，不要提问，不超过30字。"
-    )
-
-    def _apply_vision_settings(self):
-        """灵宠中心保存后调用：按新设置启停观察定时器。"""
-        on = (self.settings.get("proactive_vision", False)
-              and self.settings.get("ai_enabled"))
-        check_sec = max(5, int(self.settings.get("vision_check_sec", 60)))
-        if on:
-            self.vision_timer.start(check_sec * 1000)
-        else:
-            self.vision_timer.stop()
-
-    def _grab_gray_thumb(self):
-        """当前屏 → 9×8 灰度字节（dHash 输入）。失败返回 None。
-
-        只取 72 字节的极低清缩略图：判闲置够用，本身不含可读信息。
-        """
-        try:
-            from PySide6.QtGui import QImage
-            img = (self.current_screen().grabWindow(0)
-                   .toImage()
-                   .convertToFormat(QImage.Format.Format_Grayscale8)
-                   .scaled(9, 8, Qt.AspectRatioMode.IgnoreAspectRatio,
-                           Qt.TransformationMode.FastTransformation))
-            w, bpl = img.width(), img.bytesPerLine()
-            data = bytes(img.constBits())
-            return b"".join(data[y * bpl: y * bpl + w] for y in range(8))
-        except Exception:
-            log(f"[error] 缩略图截图失败:\n{traceback.format_exc()}")
-            return None
-
-    def _grab_jpeg_b64(self, max_w=1024, quality=70):
-        """当前屏截图 → 等比缩到 max_w 内 → JPEG base64。失败返回 None。"""
-        try:
-            from PySide6.QtGui import QImage
-            img = self.current_screen().grabWindow(0).toImage()
-            if img.width() > max_w:
-                img = img.scaledToWidth(max_w, Qt.TransformationMode.SmoothTransformation)
-            ba = QByteArray()
-            buf = QBuffer(ba)
-            buf.open(QIODevice.OpenModeFlag.WriteOnly)
-            img.save(buf, "JPG", quality)
-            import base64 as _b64
-            return _b64.b64encode(bytes(ba)).decode("ascii")
-        except Exception:
-            log(f"[error] 截图编码失败:\n{traceback.format_exc()}")
-            return None
-
-    def _on_vision_tick(self):
-        """观察节拍：截缩略图 → 哈希 → 闲置判定 → 白名单 → 视觉模型。"""
-        try:
-            now = time.time()
-            s = self.settings
-            if not (s.get("proactive_vision") and s.get("ai_enabled")):
-                return
-            # 睡眠/拖拽/已有调用在跑/正在聊天 → 不打扰
-            if (self._is_sleeping() or self._sleep_pending or self.state == "drag"
-                    or self._vision_busy or self._chat_busy):
-                return
-            if self._vision.in_cooldown(now):
-                return
-            # 人也得闲置：最近 vision_idle_min 内没摸过猫
-            idle_sec = max(60, s.get("vision_idle_min", 10) * 60)
-            if now - self.last_touch_ts < idle_sec:
-                return
-            # 画面闲置：连续 N 帧哈希不变（边沿触发，只在进入闲置那一刻为 True）
-            thumb = self._grab_gray_thumb()
-            if thumb is None:
-                return
-            if not self._vision.update(dhash(thumb), now):
-                return
-            # 隐私红线：前台进程命中白名单才允许把截图送模型
-            proc = foreground_process_path()
-            if not process_allowed(proc, s.get("vision_process_whitelist") or []):
-                log(f"[vision] 前台进程 {proc!r} 不在白名单，跳过本次主动观察")
-                return
-            b64 = self._grab_jpeg_b64()
-            if not b64:
-                return
-            # 无论模型成败都先记冷却，避免失败时连环截图重试
-            self._vision.notify_chat(now)
-            self._vision_busy = True
-            self._vision_worker = VisionWorker(self.ai, b64, self._VISION_PROMPT)
-            self._vision_worker.result_ready.connect(self._on_vision_result)
-            self._vision_worker.finished.connect(lambda: setattr(self, "_vision_busy", False))
-            self._vision_worker.start()
-        except Exception:
-            # 观察循环绝不带崩主程序（红线：不吞异常 → 记日志后继续下一拍）
-            log(f"[error] 主动行为 tick 异常:\n{traceback.format_exc()}")
-
-    def _on_vision_result(self, ans):
-        """视觉模型回复 → 气泡；失败静默（下一轮冷却后再试）。"""
-        if not ans or str(ans).startswith("__ERR__"):
-            log(f"[vision] 视觉模型调用失败，本次放弃: {ans!r}")
-            return
-        ans = str(ans).strip()
-        if len(ans) > 60:
-            ans = ans[:60] + "…"
-        self.bubble.say(ans, (self.x(), self.y(), self.width()), ms=4000)
-
     def _on_ai_result(self, ans):
         if not ans or ans.startswith("__ERR__"):
             log(f"[ai] 调用失败，回退内置文案: {ans}")
@@ -2714,126 +2488,6 @@ class PetWindow(QLabel):
             self.set_frame(self.pix_open)
             self.schedule_next_blink()
             self.behavior_timer.start(self._interval_ms("walk_min_sec", "walk_max_sec", 12, 30))
-
-    # ---------- 鼠标：拖拽 + 点击 ----------
-    def mousePressEvent(self, event):
-        self.last_touch_ts = time.time()
-        # T10：飞行中按下 = 空中抓住，立即停止物理
-        if self.physics_timer.isActive():
-            self.physics_timer.stop()
-            self._phys.catch()
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._press_was_sleep = False
-            self._press_pos = event.globalPosition().toPoint()
-            self._dragging = False
-            self._offset = self._press_pos - self.pos()
-            # 睡眠中：不触发普通反应，而是累积"叫醒点击"
-            if self._is_sleeping():
-                self._press_was_sleep = True
-                self._wake_click_count += 1
-                if self._wake_click_count >= 3:
-                    self.wake_up()
-                else:
-                    self._wake_click_timer.start(2500)
-                    self.bubble.say("呼噜… Zzz…（再点几下叫醒我）",
-                                    (self.x(), self.y(), self.width()), ms=1500)
-
-    def mouseDoubleClickEvent(self, event):
-        # 双击 = 和小江聊天（单击仍是"被点击反应"）
-        self.last_touch_ts = time.time()
-        if self._is_sleeping():
-            self.wake_up()
-        self.open_chat_input()
-
-    def mouseMoveEvent(self, event):
-        if not hasattr(self, "_press_pos"):
-            return
-        gp = event.globalPosition().toPoint()
-        # 移动超过 6px 才算拖拽，避免点击误判
-        if not self._dragging and (gp - self._press_pos).manhattanLength() > 6:
-            # 睡眠中被拎起 → 先唤醒，再进入正常拖拽分支
-            if self.state == "sleep" or self._sleep_pending:
-                self.wake_up()
-            self._dragging = True
-            self.state = "drag"
-            if self.settings.get("drag_physics", True):
-                self._phys.start_drag(gp.x(), gp.y())
-            for t in (self.blink_timer, self.unblink_timer, self.react_timer,
-                      self.walk_timer, self.behavior_timer, self.action_timer):
-                t.stop()
-            self.action_name = None
-            self._sleep_pending = False
-            self.set_frame(self.pix_surprise)  # 被拎起来：瞪圆眼睛
-        if self._dragging:
-            if self.settings.get("drag_physics", True):
-                self._phys.feed(gp.x(), gp.y())
-            self.move(gp - self._offset)
-
-    def mouseReleaseEvent(self, event):
-        if not hasattr(self, "_press_pos"):
-            return
-        was_sleep_press = getattr(self, "_press_was_sleep", False)
-        if hasattr(self, "_press_was_sleep"):
-            del self._press_was_sleep
-        if self._dragging:
-            # T10：甩抛判定 —— 释放速度够大就飞出去（重力+反弹），落地再收尾
-            flew = False
-            if self.settings.get("drag_physics", True):
-                self._phys.set_bounds(*self._physics_bounds())
-                vx, vy, flying = self._phys.release()
-                if flying:
-                    flew = True
-                    self._phys_bounced = False
-                    self.state = "drag"      # 维持"被控制"态，落地才回 idle
-                    self.physics_timer.start(16)
-            if not flew:
-                # 轻放 / 物理关闭：原有逻辑（记住位置，回待机）
-                self._after_drag_settle()
-        else:
-            # 原地没动 = 单击 → 触发反应
-            # 但睡眠中发起的点击（含凑满 3 次刚唤醒那一下）不做普通反应
-            if not was_sleep_press:
-                self.start_react()
-        self.last_touch_ts = time.time()
-        del self._press_pos
-
-    # ---------- T10 拖拽物理 ----------
-    def _physics_bounds(self):
-        """当前屏可用区域扣除宠物自身宽高 → 宠物左上角可移动范围。"""
-        ag = self.current_screen().availableGeometry()
-        return (float(ag.left()), float(ag.top()),
-                float(ag.right()) - self.width() + 1,
-                float(ag.bottom()) - self.height() + 1)
-
-    def _after_drag_settle(self):
-        """拖拽/飞行结束的统一收尾：保存位置，回待机。"""
-        self.settings["pos_x"], self.settings["pos_y"] = self.x(), self.y()
-        save_settings(self.settings)
-        self.state = "idle"
-        self.set_frame(self.pix_open)
-        self.schedule_next_blink()
-        if self.settings["auto_walk"]:
-            self.behavior_timer.start(self._interval_ms("walk_min_sec", "walk_max_sec", 12, 30))
-
-    def _on_physics_tick(self):
-        """飞行积分一帧（~60fps）。落地静止后停表并收尾。"""
-        try:
-            x, y = self._phys.step(0.016)
-            self.move(round(x), round(y))
-            if self._phys.bounce_count() > 0:
-                self._phys_bounced = True
-            if self._phys.state == "idle":
-                self.physics_timer.stop()
-                bounced = self._phys_bounced
-                self._after_drag_settle()
-                if bounced:
-                    # 摔过一跤：落地播个"吓一跳"反应
-                    self.start_react()
-        except Exception:
-            # 物理循环绝不带崩主程序（项目红线：不吞异常 → 记日志后停表）
-            log(f"[error] 拖拽物理帧异常:\n{traceback.format_exc()}")
-            self.physics_timer.stop()
-            self._after_drag_settle()
 
     # ---------- 右键菜单 ----------
     def contextMenuEvent(self, event):
@@ -2973,7 +2627,6 @@ def main():
         settings["ai_persona"] = build_persona(
             settings.get("personality", "粘人"), settings.get("pet_name", "小江"))
     pet = PetWindow(settings)
-    pet.agent_state.connect(pet.on_agent_state)  # T9：信号-槽
     pet.show()
 
     tray = make_tray(pet)  # 必须保持引用，否则托盘被回收
@@ -2987,6 +2640,7 @@ def main():
         f"高度={pet.compute_display_height()}px 系数={settings['height_factor']} "
         f"模式={settings['mode']}")
     exit_code = app.exec()
+    pet.stop_agent_link()   # T9：优雅停轮询线程（daemon 兜底，正常走这）
     log(f"退出 · code={exit_code}")
     sys.exit(exit_code)
 
