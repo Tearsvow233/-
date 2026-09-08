@@ -6,7 +6,7 @@ echo    BabyCat 一键重打包（最新源码 -^> exe）
 echo ============================================
 echo.
 echo [1/3] 用最新源码打包 dist\BabyCat.exe ...
-C:\Users\zhq\.workbuddy\binaries\python\envs\default\Scripts\python.exe -m PyInstaller BabyCat.spec --noconfirm
+.venv\Scripts\python.exe -m PyInstaller BabyCat.spec --noconfirm
 if %errorlevel% neq 0 (
     echo.
     echo [X] 打包失败！请把上方红色报错发给开发助手。
