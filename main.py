@@ -265,7 +265,7 @@ DEFAULT_SETTINGS = {
     "height_factor": 1.0,  # 体型系数：相对当前屏基准高度（0.75~1.25）
     "mode": "normal",      # normal=正常眨眼 / silent=省电静默
     "auto_walk": True,     # 是否自动散步
-    "drag_physics": True,  # T10 拖拽物理：甩抛+重力+屏幕反弹（关=松手即停）
+    "drag_physics": False,  # T10 拖拽弹射：甩抛+重力+屏幕反弹（默认关，避免拖动误触；灵宠中心可开）
     # 自定义提醒列表（L1 升级：纯本地定时器，零 API 成本）
     # 喝水/久坐等提醒统一走 reminders（旧 water_min/sit_min 启动时自动迁移）
     # 每项：{"name": "...", "interval_min": N, "enabled": True}
@@ -661,6 +661,10 @@ class PetCenter(QDialog):
         self.walk_check.setChecked(settings["auto_walk"])
         form.addRow("", self.walk_check)
 
+        self.physics_check = QCheckBox("拖拽弹射（甩出去会撞屏弹跳；关闭则松手即停）")
+        self.physics_check.setChecked(settings.get("drag_physics", False))
+        form.addRow("", self.physics_check)
+
         self.autostart_check = QCheckBox("开机自动启动小江")
         self.autostart_check.setChecked(is_autostart())
         form.addRow("", self.autostart_check)
@@ -898,7 +902,7 @@ class PetCenter(QDialog):
         return {
             "pet_name": self.name_edit.text().strip() or "小江",
             "height_factor": round(self.size_slider.value() / 100.0, 2),
-            "auto_walk": self.walk_check.isChecked(),
+            "auto_walk": self.walk_check.isChecked(), "drag_physics": self.physics_check.isChecked(),
             "autostart": self.autostart_check.isChecked(),   # 不写进 settings
             "reminders": self.reminders_work,  # 自定义提醒列表（工作副本，点保存才提交）
             # 性格与行为节奏
@@ -1553,8 +1557,7 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
 
     @staticmethod
     def _build_mask(pm):
-        """由 alpha 手工构建 1-bit 遮罩。不用 pm.mask()：其平台位图对镜像内容
-        会被 Windows 窗体区域错误裁切（tools/probe_mask_fix.py 矩阵验证）。"""
+        """手工构建 1-bit 遮罩（pm.mask() 平台位图对镜像内容会被 Windows 错误裁切，见 tools/probe_mask_fix.py）"""
         img = pm.toImage().convertToFormat(QImage.Format.Format_ARGB32)
         flat = QImage(img.size(), QImage.Format.Format_ARGB32)
         flat.fill(Qt.GlobalColor.black)

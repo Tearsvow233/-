@@ -70,7 +70,7 @@ class DragMixin:
                 self.wake_up()
             self._dragging = True
             self.state = "drag"
-            if self.settings.get("drag_physics", True):
+            if self.settings.get("drag_physics", False):
                 self._phys.start_drag(gp.x(), gp.y())
             for t in (self.blink_timer, self.unblink_timer, self.react_timer,
                       self.walk_timer, self.behavior_timer, self.action_timer):
@@ -79,7 +79,7 @@ class DragMixin:
             self._sleep_pending = False
             self.set_frame(self.pix_surprise)  # 被拎起来：瞪圆眼睛
         if self._dragging:
-            if self.settings.get("drag_physics", True):
+            if self.settings.get("drag_physics", False):
                 self._phys.feed(gp.x(), gp.y())
             self.move(gp - self._offset)
 
@@ -92,7 +92,7 @@ class DragMixin:
         if self._dragging:
             # T10：甩抛判定 —— 释放速度够大就飞出去（重力+反弹），落地再收尾
             flew = False
-            if self.settings.get("drag_physics", True):
+            if self.settings.get("drag_physics", False):
                 self._phys.set_bounds(*self._physics_bounds())
                 vx, vy, flying = self._phys.release()
                 if flying:
