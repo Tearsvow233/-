@@ -1292,8 +1292,8 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
                 return list(order)
             return list(idx["frames"].keys())
         names = ["idle_open.png", "idle_blink.png",
-                 "walk_1.png", "walk_2.png", "walk_3.png", "walk_4.png",
                  "click_surprise.png", "click_happy.png"]
+        names += [f"walk_r_{i:02d}.png" for i in range(1, 53)]
         for name in ACTIONS:
             i = 1
             while (SPRITES_DIR / f"{name}_{i:02d}.png").exists():
@@ -1518,9 +1518,11 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
 
         self.pix_open = load("idle_open.png")
         self.pix_blink = load("idle_blink.png")
-        self.walk_left = [load(f"walk_{i}.png") for i in range(1, 5)]
-        self.walk_right = [p.transformed(
-            QTransform().scale(-1, 1)) for p in self.walk_left]  # 镜像帧：向右走
+        # 行走循环：walk_r_*.png 由 tools/make_walk_cycle.py 从 pace_144-191 生成
+        # （质心对齐原地化 + 接缝 4 帧交叉淡化），24fps 原速；向左走用镜像
+        self.walk_right = [load(f"walk_r_{i:02d}.png") for i in range(1, 53)]
+        self.walk_left = [p.transformed(
+            QTransform().scale(-1, 1)) for p in self.walk_right]  # 镜像帧：向左走
         self.pix_surprise = load("click_surprise.png")
         self.pix_happy = load("click_happy.png")
 
@@ -2457,15 +2459,15 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         self.state = "walk"
         self.blink_timer.stop(); self.unblink_timer.stop()
         self.walk_dir = random.choice((1, -1))
-        # 33ms 一拍：90~210 拍 ≈ 走 3~7 秒，每拍 2px ≈ 60px/s
+        # 42ms 一拍 = 24fps（与素材原速一致）：90~210 拍 ≈ 走 3.8~8.8 秒，
+        # 每拍 3px ≈ 71px/s，与步伐节奏大致匹配
         self.walk_ticks_left = random.randint(90, 210)
         self.walk_frame = 0
-        self._frame_hold = 0
-        self.walk_timer.start(33)
+        self.walk_timer.start(42)
 
     def walk_step(self):
         screen = self.current_screen().availableGeometry()
-        nx = self.x() + self.walk_dir * 2
+        nx = self.x() + self.walk_dir * 3
         # 屏幕边缘掉头
         if nx <= screen.left():
             self.walk_dir = 1; nx = screen.left()
@@ -2473,13 +2475,10 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
             self.walk_dir = -1; nx = screen.right() - self.width()
         self.move(nx, self.y())
 
-        # 位置每拍(33ms)都动 → 30fps 平滑；贴图帧每 3 拍换一张（素材只有4帧）
-        self._frame_hold += 1
-        if self._frame_hold >= 3:
-            self._frame_hold = 0
-            self.walk_frame += 1
-            frames = self.walk_right if self.walk_dir == 1 else self.walk_left
-            self.set_frame(frames[self.walk_frame % 4])
+        # 位置与贴图同步推进：24fps 连贯步伐
+        frames = self.walk_right if self.walk_dir == 1 else self.walk_left
+        self.walk_frame = (self.walk_frame + 1) % len(frames)
+        self.set_frame(frames[self.walk_frame])
 
         self.walk_ticks_left -= 1
         if self.walk_ticks_left <= 0:

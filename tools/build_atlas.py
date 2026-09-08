@@ -29,9 +29,10 @@ INDEX_FILE = ATLAS_DIR / "atlas_index.json"
 MAX_STRIP_W = 16384  # 单片宽度上限（px）：512 高时 33MB/片，raster 下安全
 
 # 与 main.py 的 _frame_names() 保持一致的单帧清单
+# walk_r_*.png 由 tools/make_walk_cycle.py 生成（52 帧行走循环）
 SINGLES = ["idle_open.png", "idle_blink.png",
-           "walk_1.png", "walk_2.png", "walk_3.png", "walk_4.png",
-           "click_surprise.png", "click_happy.png"]
+           "click_surprise.png", "click_happy.png"] + \
+          [f"walk_r_{i:02d}.png" for i in range(1, 53)]
 
 # 与 main.py ACTIONS 定义顺序一致（此处只需键序列）
 ACTIONS = ["sleep", "stretch", "walk_circle", "wake", "groom",
