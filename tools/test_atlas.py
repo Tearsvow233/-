@@ -67,14 +67,14 @@ def main_():
     files = list(m.ATLAS_DIR.glob("*.png"))
     n_frames = len(idx["frames"])
     check("atlas_file_count", 1 <= len(files) <= 40, "%d 个 PNG" % len(files))
-    check("atlas_total_frames", n_frames == 548, "%d 帧" % n_frames)
+    check("atlas_total_frames", n_frames == 496, "%d 帧" % n_frames)
     singles = {"idle_open.png", "idle_blink.png", "click_surprise.png",
-               "click_happy.png", "walk_r_01.png", "walk_r_52.png"}
+               "click_happy.png"}
     check("atlas_covers_singles", singles <= set(idx["frames"]))
     order = idx.get("order") or []
     check("atlas_order_consistent", len(order) == n_frames and set(order) == set(idx["frames"]))
 
-    # 源散帧仍在（回退保障）。552 = 548 在用 + 4 张已退役旧走帧 walk_1..4（仅存档）
+    # 源散帧仍在（回退保障）。552 = 496 在用 + 4 旧走帧 walk_1..4 + 52 退役 walk_r（存档）
     n_src = len(list(m.SPRITES_DIR.glob("*.png")))
     check("sprites_fallback_intact", n_src == 552, "%d 散帧" % n_src)
 
@@ -109,7 +109,7 @@ def main_():
                if any(f.isNull() or f.height() != phys for f in fs)]
         check("atlas_frames_valid_size", not bad, "坏动作: %s" % bad)
         check("atlas_idle_valid", not w.pix_open.isNull() and w.pix_open.height() == h)
-        check("atlas_walk_frames", len(w.walk_left) == 52 and len(w.walk_right) == 52)
+        check("atlas_walk_frames", len(w.walk_seq) == 213 and len(w.walk_seq_mir) == 213)
 
         # ---------- 3. 缓存构建与热启动 ----------
         wait_cache_build(w)
@@ -124,7 +124,7 @@ def main_():
         covered = set()
         for rects in man.get("layout", {}).values():
             covered.update(rects.keys())
-        check("cache_covers_all", len(covered) == 548, "%d 帧" % len(covered))
+        check("cache_covers_all", len(covered) == 496, "%d 帧" % len(covered))
 
         t0 = time.time()
         w.reload_sprites()

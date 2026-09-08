@@ -22,6 +22,7 @@ import json
 import time
 import shutil
 import action_scheduler
+import pet_walk
 # T8/T9/T10 的 Qt 集成层 Mixin（T5 行数预算：main.py 只做装配；
 # 纯逻辑层在 agent_link / drag_physics / proactive_vision）
 from pet_drag import DragMixin
@@ -245,6 +246,7 @@ ACTION_LABELS = {  # 测试按钮 / 提示用
     "wake": "睡醒张望", "groom": "舔爪洗脸", "settle": "蜷回去睡",
     "recoil": "后仰站起", "spin": "抬手转圈", "pace": "左右踱步",
 }
+
 
 # ---------- 显示尺寸自适应（上下限 + 按屏幕比例 + 用户相对系数） ----------
 MIN_PET_H = 80            # 显示高度下限 px：再小五官就看不清了
@@ -1162,8 +1164,8 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         self._sleep_pending = False        # True=正在播放入睡动画，播完落定 sleep 态
 
         self.walk_frame = 0
-        self.walk_dir = 1       # 1=向右 -1=向左
-        self.walk_ticks_left = 0
+        self.walk_dir = 1       # 剧本主体朝向（镜像轮为 -1）
+        self._walk_mir = False
 
         # 测试动作循环列表
         self.test_actions = list(ACTIONS.keys())
@@ -1293,7 +1295,6 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
             return list(idx["frames"].keys())
         names = ["idle_open.png", "idle_blink.png",
                  "click_surprise.png", "click_happy.png"]
-        names += [f"walk_r_{i:02d}.png" for i in range(1, 53)]
         for name in ACTIONS:
             i = 1
             while (SPRITES_DIR / f"{name}_{i:02d}.png").exists():
@@ -1518,11 +1519,6 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
 
         self.pix_open = load("idle_open.png")
         self.pix_blink = load("idle_blink.png")
-        # 行走循环：walk_r_*.png 由 tools/make_walk_cycle.py 从 pace_144-191 生成
-        # （质心对齐原地化 + 接缝 4 帧交叉淡化），24fps 原速；向左走用镜像
-        self.walk_right = [load(f"walk_r_{i:02d}.png") for i in range(1, 53)]
-        self.walk_left = [p.transformed(
-            QTransform().scale(-1, 1)) for p in self.walk_right]  # 镜像帧：向左走
         self.pix_surprise = load("click_surprise.png")
         self.pix_happy = load("click_happy.png")
 
@@ -1537,6 +1533,12 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
                 log(f"加载动作序列 {name}: {len(frames)} 帧")
             else:
                 log(f"[warn] 动作序列 {name} 无素材")
+
+        # 散步序列 = pace 完整踱步剧本 + 镜像收尾（构造逻辑见 pet_walk.py）
+        pace_frames = self.action_frames.get("pace", [])
+        _mir = lambda pm: pm.transformed(QTransform().scale(-1, 1))
+        self.walk_seq, self.walk_seq_mir = pet_walk.build_walk_seq(pace_frames, _mir)
+        log(f"散步序列: {len(self.walk_seq)} 帧（pace 剧本 + 镜像收尾）")
 
         self.set_frame(self.pix_open)
         self.adjustSize()
@@ -2458,35 +2460,40 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
             return
         self.state = "walk"
         self.blink_timer.stop(); self.unblink_timer.stop()
-        self.walk_dir = random.choice((1, -1))
-        # 42ms 一拍 = 24fps（与素材原速一致）：90~210 拍 ≈ 走 3.8~8.8 秒，
-        # 每拍 3px ≈ 71px/s，与步伐节奏大致匹配
-        self.walk_ticks_left = random.randint(90, 210)
+        # 50% 概率整体镜像：先左后右 / 先右后左，避免每次都同一路线
+        self._walk_mir = random.random() < 0.5
+        self.walk_dir = -1 if self._walk_mir else 1   # 剧本主体朝右走（镜像轮朝左）
         self.walk_frame = 0
-        self.walk_timer.start(42)
+        self.walk_timer.start(42)   # 24fps 素材原速
 
     def walk_step(self):
-        screen = self.current_screen().availableGeometry()
-        nx = self.x() + self.walk_dir * 3
-        # 屏幕边缘掉头
-        if nx <= screen.left():
-            self.walk_dir = 1; nx = screen.left()
-        elif nx + self.width() >= screen.right():
-            self.walk_dir = -1; nx = screen.right() - self.width()
-        self.move(nx, self.y())
+        seq = self.walk_seq_mir if self._walk_mir else self.walk_seq
+        k = self.walk_frame
+        if k >= len(seq):
+            self._finish_walk()
+            return
+        # 窗口位移 = 预计算的画布内质心位移 × 缩放比（跟随：猫走窗走、猫停窗停）
+        dx = pet_walk.PACE_DX[k] * (-1 if self._walk_mir else 1)
+        dx = round(dx * self.width() / 512.0)
+        if dx:
+            screen = self.current_screen().availableGeometry()
+            nx = self.x() + dx
+            if nx < screen.left() or nx + self.width() > screen.right():
+                self.walk_frame = len(seq)   # 撞屏幕边缘：提前结束散步
+            else:
+                self.move(nx, self.y())
+        self.set_frame(seq[k])
+        self.walk_frame += 1
+        if self.walk_frame >= len(seq):
+            self._finish_walk()
 
-        # 位置与贴图同步推进：24fps 连贯步伐
-        frames = self.walk_right if self.walk_dir == 1 else self.walk_left
-        self.walk_frame = (self.walk_frame + 1) % len(frames)
-        self.set_frame(frames[self.walk_frame])
-
-        self.walk_ticks_left -= 1
-        if self.walk_ticks_left <= 0:
-            self.walk_timer.stop()
-            self.state = "idle"
-            self.set_frame(self.pix_open)
-            self.schedule_next_blink()
-            self.behavior_timer.start(self._interval_ms("walk_min_sec", "walk_max_sec", 12, 30))
+    def _finish_walk(self):
+        """散步结束：回到 idle（序列末帧已是坐姿，与 idle 平滑衔接）"""
+        self.walk_timer.stop()
+        self.state = "idle"
+        self.set_frame(self.pix_open)
+        self.schedule_next_blink()
+        self.behavior_timer.start(self._interval_ms("walk_min_sec", "walk_max_sec", 12, 30))
 
     # ---------- 右键菜单 ----------
     def contextMenuEvent(self, event):
