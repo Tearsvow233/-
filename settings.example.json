@@ -3,6 +3,7 @@
   "height": 100,
   "mode": "normal",
   "auto_walk": true,
+  "drag_physics": true,
   "reminders": [
     {
       "name": "下课",
@@ -42,5 +43,23 @@
   "ai_api_key": "待填",
   "ai_base_url": "https://open.bigmodel.cn/api/paas/v4",
   "ai_model": "glm-4-flash-250414",
-  "ai_persona": "你是一只叫小江的布偶猫桌面宠物，可爱、有点傲娇、爱撒娇。用中文简短回复，不超过30字，可以带点语气词。"
+  "ai_persona": "你是一只叫小江的布偶猫桌面宠物，可爱、有点傲娇、爱撒娇。用中文简短回复，不超过30字，可以带点语气词。",
+  "proactive_vision": false,
+  "vision_idle_min": 10,
+  "vision_check_sec": 60,
+  "vision_cooldown_min": 30,
+  "vision_process_whitelist": [
+    "chrome",
+    "msedge",
+    "firefox",
+    "code",
+    "idea64",
+    "pycharm64",
+    "devenv",
+    "notepad",
+    "obsidian",
+    "typora",
+    "explorer"
+  ],
+  "ai_vision_model": ""
 }

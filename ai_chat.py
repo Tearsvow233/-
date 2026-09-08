@@ -76,6 +76,51 @@ class PetAI:
             # 调用方据此回退到 canned 文案
             return f"__ERR__{e}"
 
+    # ---------- T8：视觉模型（截图 → 主动搭话）----------
+    def reply_vision(self, image_b64, prompt, history=None,
+                     mime="image/jpeg", max_tokens=80):
+        """带一张截图的多模态调用；不可用/出错返回 None（调用方静默跳过）。
+
+        image_b64: JPEG/PNG 的 base64 字符串。
+        prompt: 送给模型的文字指令（如"看一眼主人在干嘛，说句话"）。
+        模型用 ai_vision_model，未配置则回落 ai_model（需模型本身支持图片）。
+        """
+        c = self._cfg()
+        if not c["enabled"] or not c["key"] or not image_b64:
+            return None
+        vision_model = (self.settings.get("ai_vision_model", "") or "").strip() or c["model"]
+        messages = [{"role": "system", "content": c["persona"] + " " + self._time_context()}]
+        if history:
+            for h in history[-12:]:
+                if h.get("role") in ("user", "assistant") and h.get("content"):
+                    messages.append({"role": h["role"], "content": h["content"]})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
+            ],
+        })
+        payload = {
+            "model": vision_model,
+            "messages": messages,
+            "temperature": 0.9,
+            "max_tokens": int(max_tokens),
+        }
+        url = c["base"] + "/chat/completions"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {c['key']}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                obj = json.loads(resp.read().decode("utf-8"))
+            content = obj["choices"][0]["message"]["content"].strip()
+            return content or None
+        except Exception as e:
+            return f"__ERR__{e}"
+
     # ---------- L3：把一句话解析成结构化提醒（LLM 只输出时间意图，日期差本地算）----------
     _SPEC_SYSTEM = (
         "你是提醒任务解析器。把用户的一句话解析成提醒，只输出一个 JSON 对象，"
