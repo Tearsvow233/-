@@ -31,6 +31,7 @@ WM_BOX = (600, 1188, 700, 1234)   # eat.mp4 豆包水印外接框(含余量)
 ACTIONS = ("eat", "drink", "play", "hiss")
 
 _session = None
+_session_birefnet = None
 
 
 def get_session():
@@ -38,6 +39,14 @@ def get_session():
     if _session is None:
         _session = new_session("isnet-general-use")
     return _session
+
+
+def get_birefnet_session():
+    """isnet 抠丢时的兜底模型（白猫贴浅色地板/运动模糊帧明显更强）。"""
+    global _session_birefnet
+    if _session_birefnet is None:
+        _session_birefnet = new_session("birefnet-general")
+    return _session_birefnet
 
 
 def extract_frames(action, fps=FPS):
@@ -93,13 +102,27 @@ def clean_alpha(rgba):
     return Image.fromarray(arr)
 
 
+def coverage(rgba):
+    a = np.array(rgba.getchannel("A"))
+    return (a > 110).mean() * 100
+
+
 def mat_frames(action, frames):
     out = []
+    fallback_n = 0
     for i, f in enumerate(frames):
         if action == "eat":
             f = inpaint_watermark(f)
         m = remove(f, session=get_session(), post_process_mask=True)
+        # isnet 偶尔整帧抠丢（覆盖率异常低）→ 换 birefnet 兜底
+        if coverage(m) < 25:
+            m2 = remove(f, session=get_birefnet_session(), post_process_mask=True)
+            if coverage(m2) > coverage(m):
+                m = m2
+                fallback_n += 1
         out.append(clean_alpha(m))
+    if fallback_n:
+        print(f"[{action}] {fallback_n} 帧用 birefnet 兜底重抠")
     return out
 
 
@@ -162,9 +185,12 @@ def export_sprites(action, frames, target_h=SPRITE_H):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "test"
+    only = sys.argv[2] if len(sys.argv) > 2 else None   # 只处理指定动作
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
     for action in ACTIONS:
+        if only and action != only:
+            continue
         frames = extract_frames(action)
         print(f"[{action}] 抽帧 {len(frames)} 张")
         frames = frames[:1] if mode == "test" else frames
