@@ -243,12 +243,26 @@ ACTIONS = {
     "recoil":      {"fps": 24, "loop": False, "loops": 1, "weight": 1, "auto": False},  # 点击反馈：后仰站起（2.5s/60帧）
     "spin":        {"fps": 24, "loop": False, "loops": 1, "weight": 1, "auto": True},   # 抬手+歪头+转圈（5s/120帧）
     "pace":        {"fps": 24, "loop": False, "loops": 1, "weight": 1, "auto": True},   # 左右移动踱步（8s/192帧）
+    # ---- 互动动作（AI 生成视频 → 抠图，tools/make_action_gifs.py 生成素材）----
+    "eat":         {"fps": 15, "loop": False, "loops": 1, "weight": 1, "auto": True},   # 吃饭（24帧/1.6s，含饭碗）
+    "drink":       {"fps": 15, "loop": False, "loops": 1, "weight": 1, "auto": True},   # 喝水（18帧/1.2s）
+    "play":        {"fps": 15, "loop": False, "loops": 1, "weight": 1, "auto": True},   # 玩耍扑击（46帧/3s）
+    "hiss":        {"fps": 15, "loop": False, "loops": 1, "weight": 1, "auto": False},  # 哈气（互动菜单专用，57帧/3.8s）
 }
 ACTION_LABELS = {  # 测试按钮 / 提示用
     "sleep": "睡觉", "stretch": "伸懒腰", "walk_circle": "转圈走动",
     "wake": "睡醒张望", "groom": "舔爪洗脸", "settle": "蜷回去睡",
     "recoil": "后仰站起", "spin": "抬手转圈", "pace": "左右踱步",
+    "eat": "吃饭", "drink": "喝水", "play": "玩耍", "hiss": "哈气",
 }
+
+# 互动菜单（宠物/托盘右键）专用：动作 → 菜单文案与台词
+INTERACTIONS = [
+    ("eat",   "🍚 喂饭", "开饭啦！嘎嘣嘎嘣～"),
+    ("drink", "💧 喂水", "咕嘟咕嘟……解渴！"),
+    ("play",  "🎾 逗它玩", "接住！陪我玩！"),
+    ("hiss",  "😾 挠它", "哈——！不许再挠了！"),
+]
 
 
 # ---------- 显示尺寸自适应（上下限 + 按屏幕比例 + 用户相对系数） ----------
@@ -1772,6 +1786,32 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         label = ACTION_LABELS.get(name, name)
         self.bubble.say(f"{label}~", (self.x(), self.y(), self.width()), ms=1200)
 
+    # ---------- 互动（右键菜单触发：吃饭/喝水/玩耍/哈气） ----------
+    def play_interaction(self, name):
+        """互动菜单入口：睡觉中先叫醒，再播对应动作 + 说一句台词。"""
+        line = next((l for k, _m, l in INTERACTIONS if k == name), "")
+        if name not in self.action_frames:
+            log(f"[warn] 互动动作 {name} 无素材")
+            if line:
+                self.bubble.say("（这个动作还没学会～）",
+                                (self.x(), self.y(), self.width()), ms=1500)
+            return
+        if self._is_sleeping():
+            self.wake_up()
+        self.play_action(name)
+        if line:
+            self.bubble.say(line, (self.x(), self.y(), self.width()), ms=2000)
+
+    @staticmethod
+    def add_interaction_menu(menu, parent, callback):
+        """把「互动」子菜单挂到 menu（宠物右键 / 托盘共用）。"""
+        sub = QMenu("互动", parent)
+        for key, mlabel, _line in INTERACTIONS:
+            act = QAction(mlabel, sub)
+            act.triggered.connect(lambda _=False, k=key: callback(k))
+            sub.addAction(act)
+        menu.addMenu(sub)
+
     # ---------- 空闲自动触发动作 ----------
     def schedule_next_auto_action(self):
         """安排一次未来的随机动作；非 normal 模式 / 入睡态不排（间隔在灵宠中心可调）"""
@@ -2546,6 +2586,9 @@ class PetWindow(AgentLinkMixin, DragMixin, VisionMixin, QLabel):
         menu.addAction(auto)
         menu.addSeparator()
 
+        self.add_interaction_menu(menu, menu, self.play_interaction)
+        menu.addSeparator()
+
         quit_action = QAction("退出", menu)
         quit_action.triggered.connect(lambda: QApplication.instance().quit())
         menu.addAction(quit_action)
@@ -2586,6 +2629,8 @@ def make_tray(pet):
     menu.addAction(chat_action)
     menu.addAction(quick_action)
     menu.addAction(word_action)
+    menu.addSeparator()
+    PetWindow.add_interaction_menu(menu, menu, pet.play_interaction)
     menu.addSeparator()
     menu.addAction(normal)
     menu.addAction(silent)

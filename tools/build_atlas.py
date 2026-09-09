@@ -35,7 +35,8 @@ SINGLES = ["idle_open.png", "idle_blink.png",
 
 # 与 main.py ACTIONS 定义顺序一致（此处只需键序列）
 ACTIONS = ["sleep", "stretch", "walk_circle", "wake", "groom",
-           "settle", "recoil", "spin", "pace"]
+           "settle", "recoil", "spin", "pace",
+           "eat", "drink", "play", "hiss"]
 
 
 def collect_groups():

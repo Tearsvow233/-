@@ -23,6 +23,8 @@ tools/qa_settings_backup.json
 assets/sprites_512_backup_*/
 assets/_preview/
 assets/_preview2/
+# 抠图管线中间产物（tools/make_action_gifs.py）
+assets/gif_work/
 
 # --- 演示视频 ---
 *.mp4
